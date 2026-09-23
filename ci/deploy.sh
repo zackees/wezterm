@@ -103,6 +103,9 @@ case $OSTYPE in
     ;;
   msys|cygwin)
     zipdir=WezTerm-windows-$TAG_NAME
+    if [[ "$BUILD_REASON" == "Portable" ]] ; then
+      python ci/package_windows_portable.py "$TARGET_DIR" "WezTerm-windows-portable.zip"
+    else
     if [[ "$BUILD_REASON" == "Schedule" ]] ; then
       zipname=WezTerm-windows-nightly.zip
       instname=WezTerm-nightly-setup
@@ -127,6 +130,7 @@ case $OSTYPE in
         $zipdir/mesa
     7z a -tzip $zipname $zipdir
     iscc.exe -DMyAppVersion=${TAG_NAME#nightly} -F${instname} ci/windows-installer.iss
+    fi
     ;;
   linux-gnu|linux)
     distro=$(lsb_release -is 2>/dev/null || sh -c "source /etc/os-release && echo \$NAME")
