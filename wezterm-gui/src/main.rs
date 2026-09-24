@@ -823,12 +823,9 @@ fn build_initial_mux(
 
 fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> anyhow::Result<()> {
     if opts.return_initial_exit_code
-        && (!opts.no_auto_connect || opts.domain.is_some() || opts.attach || opts.prog.is_empty())
+        && (opts.domain.is_some() || opts.attach || opts.prog.is_empty())
     {
-        anyhow::bail!(
-            "--return-initial-exit-code requires --no-auto-connect, \
-             a program, and the local domain"
-        );
+        anyhow::bail!("--return-initial-exit-code requires a program and the local domain");
     }
     if let Some(cls) = opts.class.as_ref() {
         crate::set_window_class(cls);
