@@ -23,6 +23,13 @@ use wezterm_dynamic::ToDynamic;
 use wezterm_term::input::{MouseButton, MouseEventKind as TMEK};
 use wezterm_term::{ClickPosition, LastMouseClick, StableRowIndex};
 
+fn pane_title_click_target(item: &UIItem, kind: &WMEK) -> Option<usize> {
+    match (&item.item_type, kind) {
+        (UIItemType::PaneTitle(index), WMEK::Press(MousePress::Left)) => Some(*index),
+        _ => None,
+    }
+}
+
 impl super::TermWindow {
     fn resolve_ui_item(&self, event: &MouseEvent) -> Option<UIItem> {
         let x = event.coords.x;
@@ -40,6 +47,7 @@ impl super::TermWindow {
                 self.update_title_post_status();
             }
             UIItemType::CloseTab(_)
+            | UIItemType::PaneTitle(_)
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
@@ -51,6 +59,7 @@ impl super::TermWindow {
         match item.item_type {
             UIItemType::TabBar(_) => {}
             UIItemType::CloseTab(_)
+            | UIItemType::PaneTitle(_)
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
@@ -363,10 +372,22 @@ impl super::TermWindow {
         context: &dyn WindowOps,
     ) {
         self.last_ui_item.replace(item.clone());
+        if let Some(index) = pane_title_click_target(&item, &event.kind) {
+            if let Some(tab) = Mux::get().get_active_tab_for_window(self.mux_window_id) {
+                // The zoomed pane is displayed with index zero even when its
+                // original split index is different. It is already focused.
+                if tab.get_zoomed_pane().is_none() {
+                    tab.set_active_idx(index);
+                }
+                context.invalidate();
+            }
+            return;
+        }
         match item.item_type {
             UIItemType::TabBar(item) => {
                 self.mouse_event_tab_bar(item, event, context);
             }
+            UIItemType::PaneTitle(_) => {}
             UIItemType::AboveScrollThumb => {
                 self.mouse_event_above_scroll_thumb(item, pane, event, context);
             }
@@ -1049,5 +1070,33 @@ fn mouse_press_to_tmb(press: &MousePress) -> TMB {
         MousePress::Left => TMB::Left,
         MousePress::Right => TMB::Right,
         MousePress::Middle => TMB::Middle,
+    }
+}
+
+#[cfg(test)]
+mod pane_title_tests {
+    use super::*;
+
+    #[test]
+    fn title_hit_activates_pane_and_consumes_terminal_mouse_event() {
+        let title = UIItem {
+            x: 10,
+            y: 20,
+            width: 49,
+            height: 9,
+            item_type: UIItemType::PaneTitle(2),
+        };
+        assert!(title.hit_test(10, 20));
+        assert!(title.hit_test(59, 29));
+        assert!(!title.hit_test(10, 30));
+        assert_eq!(
+            pane_title_click_target(&title, &WMEK::Press(MousePress::Left)),
+            Some(2)
+        );
+        assert_eq!(pane_title_click_target(&title, &WMEK::Move), None);
+        assert_eq!(
+            pane_title_click_target(&title, &WMEK::Press(MousePress::Right)),
+            None
+        );
     }
 }

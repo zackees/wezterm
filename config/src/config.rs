@@ -488,6 +488,10 @@ pub struct Config {
     #[dynamic(default)]
     pub tab_bar_at_bottom: bool,
 
+    /// Reserve one terminal-cell row above each pane for a locally rendered title.
+    #[dynamic(default)]
+    pub pane_title_bar: bool,
+
     #[dynamic(default = "default_true")]
     pub mouse_wheel_scrolls_tabs: bool,
 

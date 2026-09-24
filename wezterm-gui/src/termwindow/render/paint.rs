@@ -258,6 +258,8 @@ impl crate::TermWindow {
                 }
             }
             self.paint_pane(&pos, &mut layers).context("paint_pane")?;
+            self.paint_pane_title(&pos, &mut layers)
+                .context("paint_pane_title")?;
         }
 
         if let Some(pane) = self.get_active_pane_or_overlay() {

@@ -155,6 +155,7 @@ pub enum TermWindowNotif {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UIItemType {
     TabBar(TabBarItem),
+    PaneTitle(usize),
     CloseTab(usize),
     AboveScrollThumb,
     ScrollThumb,
@@ -410,6 +411,7 @@ pub struct TermWindow {
     tab_state: RefCell<HashMap<TabId, TabState>>,
     pane_state: RefCell<HashMap<PaneId, PaneState>>,
     semantic_zones: HashMap<PaneId, SemanticZoneCache>,
+    pane_title_cache: HashMap<PaneId, render::pane_title::PaneTitleCacheEntry>,
 
     window_background: Vec<LoadedBackgroundLayer>,
 
@@ -786,6 +788,7 @@ impl TermWindow {
             scheduled_animation: RefCell::new(None),
             allow_images: AllowImage::Yes,
             semantic_zones: HashMap::new(),
+            pane_title_cache: HashMap::new(),
             ui_items: vec![],
             dragging: None,
             last_ui_item: None,
@@ -3496,6 +3499,7 @@ impl TermWindow {
     }
 
     fn get_pos_panes_for_tab(&self, tab: &Arc<Tab>) -> Vec<PositionedPane> {
+        tab.set_pane_title_bar(self.config.pane_title_bar);
         let tab_id = tab.tab_id();
 
         if let Some(pane) = self
@@ -3511,6 +3515,7 @@ impl TermWindow {
                 is_zoomed: false,
                 left: 0,
                 top: 0,
+                title_top: None,
                 width: size.cols as _,
                 height: size.rows as _,
                 pixel_width: size.cols as usize * self.render_metrics.cell_size.width as usize,
