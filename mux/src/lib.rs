@@ -18,7 +18,7 @@ use parking_lot::{
 };
 use percent_encoding::percent_decode_str;
 use portable_pty::{CommandBuilder, ExitStatus, PtySize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::TryInto;
 use std::io::{Read, Write};
 #[cfg(windows)]
@@ -116,6 +116,8 @@ pub struct Mux {
     agent: Option<AgentProxy>,
     initial_pane_exit: Mutex<Option<InitialPaneExit>>,
     initial_pane_exit_changed: Condvar,
+    pane_exit_codes: Mutex<(HashMap<PaneId, u32>, VecDeque<PaneId>)>,
+    pane_exit_changed: Condvar,
 }
 
 /// Opt-in status retention for the program passed to `wezterm start`. A very
@@ -173,6 +175,16 @@ mod initial_pane_exit_tests {
         assert_eq!(tracked.exit_code(), None);
         tracked.record(42, 23);
         assert_eq!(tracked.exit_code(), Some(23));
+    }
+
+    #[test]
+    fn fast_exits_keep_independent_codes_for_concurrent_launchers() {
+        let mux = Mux::new(None);
+        mux.record_child_exit(42, &ExitStatus::with_exit_code(23));
+        mux.record_child_exit(43, &ExitStatus::with_exit_code(7));
+        assert_eq!(mux.wait_for_pane_exit_code(43).unwrap(), 7);
+        assert_eq!(mux.wait_for_pane_exit_code(42).unwrap(), 23);
+        assert!(mux.wait_for_pane_exit_code(42).is_err());
     }
 }
 
@@ -519,6 +531,8 @@ impl Mux {
             agent,
             initial_pane_exit: Mutex::new(None),
             initial_pane_exit_changed: Condvar::new(),
+            pane_exit_codes: Mutex::new((HashMap::new(), VecDeque::new())),
+            pane_exit_changed: Condvar::new(),
         }
     }
 
@@ -536,9 +550,35 @@ impl Mux {
     }
 
     pub fn record_child_exit(&self, pane_id: PaneId, status: &ExitStatus) {
+        {
+            let mut exits = self.pane_exit_codes.lock();
+            exits.0.insert(pane_id, status.exit_code());
+            exits.1.push_back(pane_id);
+            // Keep fast exits available until the spawning client can ask for
+            // their status, while bounding retention in a long lived GUI.
+            while exits.1.len() > 4096 {
+                if let Some(oldest) = exits.1.pop_front() {
+                    exits.0.remove(&oldest);
+                }
+            }
+            self.pane_exit_changed.notify_all();
+        }
         if let Some(tracked) = self.initial_pane_exit.lock().as_mut() {
             tracked.record(pane_id, status.exit_code());
             self.initial_pane_exit_changed.notify_all();
+        }
+    }
+
+    pub fn wait_for_pane_exit_code(&self, pane_id: PaneId) -> anyhow::Result<u32> {
+        let mut exits = self.pane_exit_codes.lock();
+        if !exits.0.contains_key(&pane_id) && self.get_pane(pane_id).is_none() {
+            anyhow::bail!("pane {pane_id} has no running child or retained exit status");
+        }
+        loop {
+            if let Some(code) = exits.0.remove(&pane_id) {
+                return Ok(code);
+            }
+            self.pane_exit_changed.wait(&mut exits);
         }
     }
 

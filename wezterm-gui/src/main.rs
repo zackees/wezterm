@@ -565,11 +565,17 @@ impl Publish {
         workspace: Option<&str>,
         domain: SpawnTabDomain,
         new_tab: bool,
+        return_initial_exit_code: bool,
     ) -> anyhow::Result<bool> {
         if let Publish::TryPathOrPublish(gui_sock) = &self {
             let dom = config::UnixDomain {
                 socket_path: Some(gui_sock.clone()),
                 no_serve_automatically: true,
+                read_timeout: if return_initial_exit_code {
+                    Duration::from_secs(60 * 60 * 24)
+                } else {
+                    config::default_read_timeout()
+                },
                 ..Default::default()
             };
             let mut ui = mux::connui::ConnectionUI::new_headless();
@@ -578,6 +584,8 @@ impl Publish {
                 Ok(client) => {
                     let executor = promise::spawn::ScopedExecutor::new();
                     let command = cmd.clone();
+                    let spawned_pane = Arc::new(AtomicBool::new(false));
+                    let spawned_pane_in_rpc = Arc::clone(&spawned_pane);
                     let res = block_on(executor.run(async move {
                         let vers = client.verify_version_compat(&mut ui).await?;
 
@@ -625,7 +633,7 @@ impl Publish {
                             None
                         };
 
-                        client
+                        let spawned = client
                             .spawn_v2(codec::SpawnV2 {
                                 domain,
                                 window_id,
@@ -639,11 +647,27 @@ impl Publish {
                                         .unwrap_or(mux::DEFAULT_WORKSPACE)
                                 ).to_string(),
                             })
-                            .await
+                            .await?;
+                        if return_initial_exit_code {
+                            spawned_pane_in_rpc.store(true, Ordering::Release);
+                            let status = client
+                                .wait_pane_exit(codec::WaitPaneExit {
+                                    pane_id: spawned.pane_id,
+                                })
+                                .await
+                                .context("existing GUI closed before reporting child exit status")?;
+                            Ok::<_, anyhow::Error>((spawned, Some(status.exit_code)))
+                        } else {
+                            Ok((spawned, None))
+                        }
                     }));
 
                     match res {
-                        Ok(res) => {
+                        Ok((res, code)) => {
+                            if let Some(code) = code {
+                                INITIAL_PANE_EXIT_CODE.store(code, Ordering::Relaxed);
+                                INITIAL_PANE_EXIT_REPORTED.store(true, Ordering::Release);
+                            }
                             log::info!(
                                 "Spawned your command via the existing GUI instance. \
                              Use wezterm start --always-new-process if you do not want this behavior. \
@@ -653,6 +677,9 @@ impl Publish {
                             Ok(true)
                         }
                         Err(err) => {
+                            if spawned_pane.load(Ordering::Acquire) {
+                                return Err(err);
+                            }
                             log::trace!(
                                 "while attempting to ask existing instance to spawn: {:#}",
                                 err
@@ -745,15 +772,11 @@ fn build_initial_mux(
 
 fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> anyhow::Result<()> {
     if opts.return_initial_exit_code
-        && (!opts.always_new_process
-            || !opts.no_auto_connect
-            || opts.domain.is_some()
-            || opts.attach
-            || opts.prog.is_empty())
+        && (!opts.no_auto_connect || opts.domain.is_some() || opts.attach || opts.prog.is_empty())
     {
         anyhow::bail!(
-            "--return-initial-exit-code requires --always-new-process, \
-             --no-auto-connect, a program, and the local domain"
+            "--return-initial-exit-code requires --no-auto-connect, \
+             a program, and the local domain"
         );
     }
     if let Some(cls) = opts.class.as_ref() {
@@ -812,6 +835,7 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
             None => SpawnTabDomain::DefaultDomain,
         },
         opts.new_tab,
+        opts.return_initial_exit_code,
     )? {
         return Ok(());
     }

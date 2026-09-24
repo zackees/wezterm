@@ -39,9 +39,9 @@ pub struct StartCommand {
     #[arg(long = "always-new-process")]
     pub always_new_process: bool,
 
-    /// Return the initial local pane's child exit code after the GUI closes.
-    /// For embedding callers that wait on this process; normal launches are
-    /// unchanged. Requires an explicit command and a private local instance.
+    /// Return the launched local pane's child exit code. When an existing
+    /// GUI is reused, wait for that pane without closing the shared GUI.
+    /// Requires an explicit command, --no-auto-connect, and the local domain.
     #[arg(long = "return-initial-exit-code")]
     pub return_initial_exit_code: bool,
 
