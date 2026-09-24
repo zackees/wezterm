@@ -24,7 +24,7 @@ jobs:
     runs-on: "windows-2025"
     
     env:
-      BUILD_REASON: "Schedule"
+      BUILD_REASON: ${{ github.event_name == 'workflow_dispatch' && 'Portable' || 'Schedule' }}
       CARGO_INCREMENTAL: "0"
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: "sccache"
@@ -89,11 +89,11 @@ jobs:
       - name: "Upload artifact"
         uses: actions/upload-artifact@v7
         with:
-          name: "windows"
+          name: ${{ github.event_name == 'workflow_dispatch' && 'windows-portable' || 'windows' }}
           path: |
             WezTerm-*.zip
             WezTerm-*.exe
-          retention-days: 5
+          retention-days: ${{ github.event_name == 'workflow_dispatch' && 30 || 5 }}
 
   upload:
     runs-on: ubuntu-latest

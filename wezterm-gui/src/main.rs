@@ -22,7 +22,9 @@ use std::env::current_dir;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use termwiz::cell::CellAttributes;
 use termwiz::surface::{Line, SEQ_ZERO};
 use unicode_normalization::UnicodeNormalization;
@@ -57,6 +59,9 @@ mod unicode_names;
 mod uniforms;
 mod update;
 mod utilsprites;
+
+static INITIAL_PANE_EXIT_CODE: AtomicU32 = AtomicU32::new(0);
+static INITIAL_PANE_EXIT_REPORTED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]
@@ -286,14 +291,15 @@ async fn spawn_tab_in_domain_if_mux_is_empty(
     is_connecting: bool,
     domain: Option<Arc<dyn Domain>>,
     workspace: Option<String>,
-) -> anyhow::Result<()> {
+    track_initial_exit: bool,
+) -> anyhow::Result<Option<mux::pane::PaneId>> {
     let mux = Mux::get();
 
     let domain = domain.unwrap_or_else(|| mux.default_domain());
 
     if !is_connecting {
         if have_panes_in_domain_and_ws(&domain, &workspace) {
-            return Ok(());
+            return Ok(None);
         }
     }
 
@@ -317,7 +323,7 @@ async fn spawn_tab_in_domain_if_mux_is_empty(
 
     if have_panes_in_domain_and_ws(&domain, &workspace) {
         trigger_and_log_gui_attached(MuxDomain(domain.domain_id())).await;
-        return Ok(());
+        return Ok(None);
     }
 
     let _config_subscription = config::subscribe_to_config_reload(move || {
@@ -331,16 +337,18 @@ async fn spawn_tab_in_domain_if_mux_is_empty(
     });
 
     let dpi = config.dpi.unwrap_or_else(|| ::window::default_dpi());
-    let _tab = domain
-        .spawn(
-            config.initial_size(dpi as u32, Some(cell_pixel_dims(&config, dpi)?)),
-            cmd,
-            None,
-            window_id,
-        )
-        .await?;
+    let size = config.initial_size(dpi as u32, Some(cell_pixel_dims(&config, dpi)?));
+    let initial_pane = if track_initial_exit {
+        let (_, pane_id) = domain
+            .spawn_with_pane_id(size, cmd, None, window_id)
+            .await?;
+        Some(pane_id)
+    } else {
+        domain.spawn(size, cmd, None, window_id).await?;
+        None
+    };
     trigger_and_log_gui_attached(MuxDomain(domain.domain_id())).await;
-    Ok(())
+    Ok(initial_pane)
 }
 
 async fn connect_to_auto_connect_domains() -> anyhow::Result<()> {
@@ -489,7 +497,25 @@ async fn async_run_terminal_gui(
             trigger_and_log_gui_attached(MuxDomain(domain.domain_id())).await;
         }
     }
-    spawn_tab_in_domain_if_mux_is_empty(cmd, is_connecting, domain, opts.workspace).await
+    if opts.return_initial_exit_code && mux.default_domain().downcast_ref::<LocalDomain>().is_none()
+    {
+        anyhow::bail!("--return-initial-exit-code requires the local domain");
+    }
+    let initial_pane = spawn_tab_in_domain_if_mux_is_empty(
+        cmd,
+        is_connecting,
+        domain,
+        opts.workspace,
+        opts.return_initial_exit_code,
+    )
+    .await?;
+    if opts.return_initial_exit_code {
+        let pane_id = initial_pane.ok_or_else(|| {
+            anyhow!("cannot identify initial local pane for exit-status reporting")
+        })?;
+        mux.set_initial_pane_for_exit_tracking(pane_id);
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -539,11 +565,17 @@ impl Publish {
         workspace: Option<&str>,
         domain: SpawnTabDomain,
         new_tab: bool,
+        return_initial_exit_code: bool,
     ) -> anyhow::Result<bool> {
         if let Publish::TryPathOrPublish(gui_sock) = &self {
             let dom = config::UnixDomain {
                 socket_path: Some(gui_sock.clone()),
                 no_serve_automatically: true,
+                read_timeout: if return_initial_exit_code {
+                    Duration::from_secs(60 * 60 * 24)
+                } else {
+                    config::default_read_timeout()
+                },
                 ..Default::default()
             };
             let mut ui = mux::connui::ConnectionUI::new_headless();
@@ -552,6 +584,8 @@ impl Publish {
                 Ok(client) => {
                     let executor = promise::spawn::ScopedExecutor::new();
                     let command = cmd.clone();
+                    let spawned_pane = Arc::new(AtomicBool::new(false));
+                    let spawned_pane_in_rpc = Arc::clone(&spawned_pane);
                     let res = block_on(executor.run(async move {
                         let vers = client.verify_version_compat(&mut ui).await?;
 
@@ -599,7 +633,7 @@ impl Publish {
                             None
                         };
 
-                        client
+                        let spawned = client
                             .spawn_v2(codec::SpawnV2 {
                                 domain,
                                 window_id,
@@ -613,11 +647,27 @@ impl Publish {
                                         .unwrap_or(mux::DEFAULT_WORKSPACE)
                                 ).to_string(),
                             })
-                            .await
+                            .await?;
+                        if return_initial_exit_code {
+                            spawned_pane_in_rpc.store(true, Ordering::Release);
+                            let status = client
+                                .wait_pane_exit(codec::WaitPaneExit {
+                                    pane_id: spawned.pane_id,
+                                })
+                                .await
+                                .context("existing GUI closed before reporting child exit status")?;
+                            Ok::<_, anyhow::Error>((spawned, Some(status.exit_code)))
+                        } else {
+                            Ok((spawned, None))
+                        }
                     }));
 
                     match res {
-                        Ok(res) => {
+                        Ok((res, code)) => {
+                            if let Some(code) = code {
+                                INITIAL_PANE_EXIT_CODE.store(code, Ordering::Relaxed);
+                                INITIAL_PANE_EXIT_REPORTED.store(true, Ordering::Release);
+                            }
                             log::info!(
                                 "Spawned your command via the existing GUI instance. \
                              Use wezterm start --always-new-process if you do not want this behavior. \
@@ -627,6 +677,9 @@ impl Publish {
                             Ok(true)
                         }
                         Err(err) => {
+                            if spawned_pane.load(Ordering::Acquire) {
+                                return Err(err);
+                            }
                             log::trace!(
                                 "while attempting to ask existing instance to spawn: {:#}",
                                 err
@@ -718,6 +771,14 @@ fn build_initial_mux(
 }
 
 fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> anyhow::Result<()> {
+    if opts.return_initial_exit_code
+        && (!opts.no_auto_connect || opts.domain.is_some() || opts.attach || opts.prog.is_empty())
+    {
+        anyhow::bail!(
+            "--return-initial-exit-code requires --no-auto-connect, \
+             a program, and the local domain"
+        );
+    }
     if let Some(cls) = opts.class.as_ref() {
         crate::set_window_class(cls);
     }
@@ -752,6 +813,9 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
         default_domain_name.as_deref(),
         opts.workspace.as_deref(),
     )?;
+    if opts.return_initial_exit_code {
+        mux.begin_initial_pane_exit_tracking();
+    }
 
     // First, let's see if we can ask an already running wezterm to do this.
     // We must do this before we start the gui frontend as the scheduler
@@ -771,12 +835,14 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
             None => SpawnTabDomain::DefaultDomain,
         },
         opts.new_tab,
+        opts.return_initial_exit_code,
     )? {
         return Ok(());
     }
 
     let gui = crate::frontend::try_new()?;
     let activity = Activity::new();
+    let return_initial_exit_code = opts.return_initial_exit_code;
 
     promise::spawn::spawn(async move {
         if let Err(err) = async_run_terminal_gui(cmd, opts, publish.should_publish()).await {
@@ -787,7 +853,15 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     .detach();
 
     maybe_show_configuration_error_window();
-    gui.run_forever()
+    gui.run_forever()?;
+    if return_initial_exit_code {
+        let code = mux
+            .wait_for_initial_pane_exit_code(Duration::from_secs(5))
+            .unwrap_or(1);
+        INITIAL_PANE_EXIT_CODE.store(code, Ordering::Relaxed);
+        INITIAL_PANE_EXIT_REPORTED.store(true, Ordering::Release);
+    }
+    Ok(())
 }
 
 fn fatal_toast_notification(title: &str, message: &str) {
@@ -838,6 +912,9 @@ fn main() {
     }
     Mux::shutdown();
     frontend::shutdown();
+    if INITIAL_PANE_EXIT_REPORTED.load(Ordering::Acquire) {
+        std::process::exit(INITIAL_PANE_EXIT_CODE.load(Ordering::Relaxed) as i32);
+    }
 }
 
 fn maybe_show_configuration_error_window() {
@@ -1268,6 +1345,7 @@ fn run() -> anyhow::Result<()> {
                 attach: true,
                 _cmd: false,
                 no_auto_connect: false,
+                return_initial_exit_code: false,
                 cwd: None,
             },
             Some(connect.domain_name),
