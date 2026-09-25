@@ -497,19 +497,18 @@ async fn async_run_terminal_gui(
             trigger_and_log_gui_attached(MuxDomain(domain.domain_id())).await;
         }
     }
-    if opts.return_initial_exit_code && mux.default_domain().downcast_ref::<LocalDomain>().is_none()
-    {
-        anyhow::bail!("--return-initial-exit-code requires the local domain");
+    if opts.wait_exit && mux.default_domain().downcast_ref::<LocalDomain>().is_none() {
+        anyhow::bail!("--wait-exit requires the local domain");
     }
     let initial_pane = spawn_tab_in_domain_if_mux_is_empty(
         cmd,
         is_connecting,
         domain,
         opts.workspace,
-        opts.return_initial_exit_code,
+        opts.wait_exit,
     )
     .await?;
-    if opts.return_initial_exit_code {
+    if opts.wait_exit {
         let pane_id = initial_pane.ok_or_else(|| {
             anyhow!("cannot identify initial local pane for exit-status reporting")
         })?;
@@ -576,13 +575,13 @@ impl Publish {
         workspace: Option<&str>,
         domain: SpawnTabDomain,
         new_tab: bool,
-        return_initial_exit_code: bool,
+        wait_exit: bool,
     ) -> anyhow::Result<bool> {
         if let Publish::TryPathOrPublish(gui_sock) = &self {
             let dom = config::UnixDomain {
                 socket_path: Some(gui_sock.clone()),
                 no_serve_automatically: true,
-                read_timeout: if return_initial_exit_code {
+                read_timeout: if wait_exit {
                     Duration::from_secs(60 * 60 * 24)
                 } else {
                     config::default_read_timeout()
@@ -662,7 +661,7 @@ impl Publish {
                                 ).to_string(),
                             })
                             .await?;
-                        if return_initial_exit_code {
+                        if wait_exit {
                             spawned_pane_in_rpc.store(true, Ordering::Release);
                             let status = client
                                 .wait_pane_exit(codec::WaitPaneExit {
@@ -822,10 +821,8 @@ fn build_initial_mux(
 }
 
 fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> anyhow::Result<()> {
-    if opts.return_initial_exit_code
-        && (opts.domain.is_some() || opts.attach || opts.prog.is_empty())
-    {
-        anyhow::bail!("--return-initial-exit-code requires a program and the local domain");
+    if opts.wait_exit && (opts.domain.is_some() || opts.attach || opts.prog.is_empty()) {
+        anyhow::bail!("--wait-exit requires a program and the local domain");
     }
     if let Some(cls) = opts.class.as_ref() {
         crate::set_window_class(cls);
@@ -861,7 +858,7 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
         default_domain_name.as_deref(),
         opts.workspace.as_deref(),
     )?;
-    if opts.return_initial_exit_code {
+    if opts.wait_exit {
         mux.begin_initial_pane_exit_tracking();
     }
 
@@ -883,14 +880,14 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
             None => SpawnTabDomain::DefaultDomain,
         },
         opts.new_tab,
-        opts.return_initial_exit_code,
+        opts.wait_exit,
     )? {
         return Ok(());
     }
 
     let gui = crate::frontend::try_new()?;
     let activity = Activity::new();
-    let return_initial_exit_code = opts.return_initial_exit_code;
+    let wait_exit = opts.wait_exit;
 
     promise::spawn::spawn(async move {
         if let Err(err) = async_run_terminal_gui(cmd, opts, publish.should_publish()).await {
@@ -902,7 +899,7 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
 
     maybe_show_configuration_error_window();
     gui.run_forever()?;
-    if return_initial_exit_code {
+    if wait_exit {
         let code = mux
             .wait_for_initial_pane_exit_code(Duration::from_secs(5))
             .unwrap_or(1);
@@ -1393,7 +1390,7 @@ fn run() -> anyhow::Result<()> {
                 attach: true,
                 _cmd: false,
                 no_auto_connect: false,
-                return_initial_exit_code: false,
+                wait_exit: false,
                 cwd: None,
             },
             Some(connect.domain_name),
