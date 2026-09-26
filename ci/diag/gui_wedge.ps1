@@ -5,7 +5,10 @@ param(
     [Parameter(Mandatory = $true)][string]$BinDir,
     [Parameter(Mandatory = $true)][string]$Config,
     [Parameter(Mandatory = $true)][string]$OutDir,
-    [int]$Iterations = 30
+    [int]$Iterations = 30,
+    # When set, seed and reused panes run clud.exe with mock-agent as its
+    # `claude` backend, exactly like clud's kitty_windows_smoke.ps1.
+    [string]$CludDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -48,6 +51,11 @@ function Start-Gui {
     $start.UseShellExecute = $false
     $start.Environment['CLUD_KITTYTERM_SOFTWARE_RENDERER'] = '1'
     $start.Environment['WEZTERM_LOG'] = 'info'
+    if ($CludDir) {
+        $start.Environment['PATH'] = "$Cwd;$CludDir;$env:PATH"
+        $start.Environment['CLUD_NO_UNLOCK'] = '1'
+        $start.Environment['CLUD_VERBOSE_LOG_DIR'] = $Cwd
+    }
     foreach ($a in @('--config-file', $Config, 'start', '--no-auto-connect',
             '--return-initial-exit-code', '--cwd', $Cwd, '--') + $Prog) {
         [void]$start.ArgumentList.Add([string]$a)
@@ -100,7 +108,16 @@ for ($i = 1; $i -le $Iterations; $i++) {
     $release = Join-Path $dir 'release.txt'
     $seedScript = "`$env:WEZTERM_UNIX_SOCKET + '|' + `$env:WEZTERM_PANE | Set-Content -LiteralPath '$ready'; " +
         "while (-not (Test-Path -LiteralPath '$release')) { Start-Sleep -Milliseconds 100 }; exit 23"
-    $seed = Start-Gui $dir @('powershell', '-NoProfile', '-Command', $seedScript)
+    if ($CludDir) {
+        Copy-Item (Join-Path $CludDir 'mock-agent.exe') (Join-Path $dir 'claude.exe')
+        $seed = Start-Gui $dir @((Join-Path $CludDir 'clud.exe'), '--claude', '--subprocess',
+            '--verbose', '--no-daemon', '-p', 'kitty-seed', '--',
+            '--mock-report-file', (Join-Path $dir 'seed-report.json'),
+            '--mock-started-file', $ready, '--mock-wait-for-file', $release,
+            '--mock-exit-code', '23')
+    } else {
+        $seed = Start-Gui $dir @('powershell', '-NoProfile', '-Command', $seedScript)
+    }
     $deadline = [DateTime]::UtcNow.AddSeconds(60)
     while (-not (Test-Path -LiteralPath $ready) -and [DateTime]::UtcNow -lt $deadline) {
         Start-Sleep -Milliseconds 100
@@ -110,10 +127,22 @@ for ($i = 1; $i -le $Iterations; $i++) {
         try { $seed.Kill($true) } catch { }
         continue
     }
-    $socket, $seedPane = (Get-Content -LiteralPath $ready -Raw).Trim().Split('|')
+    if ($CludDir) {
+        $started = Get-Content -LiteralPath $ready -Raw | ConvertFrom-Json
+        $socket = [string]$started.env.WEZTERM_UNIX_SOCKET
+        $seedPane = [string]$started.env.WEZTERM_PANE
+    } else {
+        $socket, $seedPane = (Get-Content -LiteralPath $ready -Raw).Trim().Split('|')
+    }
 
     # A second `start` reuses the live GUI and waits for its pane's status.
-    $reused = Start-Gui $dir @('cmd', '/c', 'exit 37')
+    if ($CludDir) {
+        $reused = Start-Gui $dir @((Join-Path $CludDir 'clud.exe'), '--claude', '--subprocess',
+            '--verbose', '-p', 'kitty-smoke', '--',
+            '--mock-report-file', (Join-Path $dir 'reused-report.json'), '--mock-exit-code', '37')
+    } else {
+        $reused = Start-Gui $dir @('cmd', '/c', 'exit 37')
+    }
     $reusedOk = $reused.WaitForExit(60000)
     $reusedCode = if ($reusedOk) { $reused.ExitCode } else { 'timeout' }
 
@@ -144,6 +173,11 @@ for ($i = 1; $i -le $Iterations; $i++) {
         $summary.Add("iter ${i}: WEDGED reused=$reusedCode")
         Write-Host "iteration $i wedged; capturing evidence"
         Save-WedgeEvidence $seed $socket (Join-Path $OutDir "wedge-$i")
+        # clud's verbose logs, reports and any process still under the seed GUI.
+        Copy-Item -Path (Join-Path $dir '*') -Destination (Join-Path $OutDir "wedge-$i") -Recurse -Force -ErrorAction SilentlyContinue
+        $tree = Get-CimInstance Win32_Process |
+            Select-Object ProcessId, ParentProcessId, Name, CommandLine | Format-Table -AutoSize | Out-String -Width 500
+        Set-Content -LiteralPath (Join-Path $OutDir "wedge-$i/all-processes.txt") -Value $tree
         try { $seed.Kill($true) } catch { }
         if ($wedges -ge 3) { break }
     }

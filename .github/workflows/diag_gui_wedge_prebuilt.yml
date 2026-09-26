@@ -26,7 +26,9 @@ jobs:
       - name: Replay smoke until wedged
         shell: pwsh
         run: |
-          pwsh -NoProfile -File ci/diag/gui_wedge.ps1 `
+          $clud = Join-Path $env:RUNNER_TEMP 'wezbin/clud'
+          $cludArgs = if (Test-Path (Join-Path $clud 'clud.exe')) { @('-CludDir', $clud) } else { @() }
+          pwsh -NoProfile -File ci/diag/gui_wedge.ps1 @cludArgs `
             -BinDir (Join-Path $env:RUNNER_TEMP 'wezbin') `
             -Config (Resolve-Path ci/diag/clud-kittyterm.lua) `
             -OutDir (Join-Path $env:GITHUB_WORKSPACE 'wedge-out') `
