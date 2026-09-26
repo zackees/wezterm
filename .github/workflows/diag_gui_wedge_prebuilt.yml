@@ -1,0 +1,40 @@
+name: diag_gui_wedge_prebuilt
+
+# Diagnostic only (clud#1293 / clud#1343): run the wedge replay against a
+# wezterm build cross-compiled on Linux with soldr and attached to a release,
+# skipping the ~40 minute native build.
+on:
+  push:
+    branches:
+      - "diag-prebuilt/**"
+
+jobs:
+  wedge:
+    runs-on: "windows-2025"
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - name: Download prebuilt binaries
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = (Get-Content ci/diag/PREBUILT_TAG -Raw).Trim()
+          gh release download $tag -R '${{ github.repository }}' -p wezbin.zip -D $env:RUNNER_TEMP
+          Expand-Archive (Join-Path $env:RUNNER_TEMP 'wezbin.zip') (Join-Path $env:RUNNER_TEMP 'wezbin')
+          Get-ChildItem (Join-Path $env:RUNNER_TEMP 'wezbin') -Recurse | Format-Table Name, Length
+      - name: Replay smoke until wedged
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File ci/diag/gui_wedge.ps1 `
+            -BinDir (Join-Path $env:RUNNER_TEMP 'wezbin') `
+            -Config (Resolve-Path ci/diag/clud-kittyterm.lua) `
+            -OutDir (Join-Path $env:GITHUB_WORKSPACE 'wedge-out') `
+            -Iterations ([int](Get-Content ci/diag/ITERATIONS -Raw).Trim())
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: wedge-evidence
+          path: wedge-out
+          if-no-files-found: warn
