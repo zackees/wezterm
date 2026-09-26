@@ -1,0 +1,67 @@
+name: diag_gui_wedge
+
+# Diagnostic only (clud#1293 / clud#1343): build wezterm-gui with line tables
+# and replay clud's Kitty smoke until the seed GUI wedges, then capture stacks.
+on:
+  push:
+    branches:
+      - "diag/**"
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: "Smoke iterations"
+        default: "30"
+
+jobs:
+  wedge:
+    runs-on: "windows-2025"
+    timeout-minutes: 120
+    env:
+      CARGO_INCREMENTAL: "0"
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+      RUSTUP_WINDOWS_PATH_ADD_BIN: "1"
+      CARGO_PROFILE_RELEASE_DEBUG: "line-tables-only"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: "recursive"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          target: "x86_64-pc-windows-msvc"
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Build wezterm and wezterm-gui
+        shell: cmd
+        run: |
+          PATH C:\Strawberry\perl\bin;%PATH%
+          cargo build -p wezterm -p wezterm-gui --release
+      - name: Stage binaries
+        shell: pwsh
+        run: |
+          $bin = Join-Path $env:RUNNER_TEMP 'wezbin'
+          New-Item -ItemType Directory -Force -Path $bin | Out-Null
+          foreach ($f in 'wezterm.exe','wezterm-gui.exe','wezterm.pdb','wezterm_gui.pdb') {
+            $src = Join-Path 'target/release' $f
+            if (Test-Path $src) { Copy-Item $src $bin }
+          }
+          Copy-Item assets/windows/conhost/conpty.dll, assets/windows/conhost/OpenConsole.exe,
+            assets/windows/angle/libEGL.dll, assets/windows/angle/libGLESv2.dll $bin
+          New-Item -ItemType Directory -Force -Path (Join-Path $bin 'mesa') | Out-Null
+          Copy-Item target/release/mesa/opengl32.dll (Join-Path $bin 'mesa')
+          Get-ChildItem $bin -Recurse | Format-Table Name, Length
+      - name: Replay smoke until wedged
+        shell: pwsh
+        run: |
+          $iters = if ('${{ github.event.inputs.iterations }}') { [int]'${{ github.event.inputs.iterations }}' } else { 30 }
+          pwsh -NoProfile -File ci/diag/gui_wedge.ps1 `
+            -BinDir (Join-Path $env:RUNNER_TEMP 'wezbin') `
+            -Config (Resolve-Path ci/diag/clud-kittyterm.lua) `
+            -OutDir (Join-Path $env:GITHUB_WORKSPACE 'wedge-out') `
+            -Iterations $iters
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: wedge-evidence
+          path: wedge-out
+          if-no-files-found: warn
