@@ -39,11 +39,11 @@ pub struct StartCommand {
     #[arg(long = "always-new-process")]
     pub always_new_process: bool,
 
-    /// Return the launched local pane's child exit code. When an existing
-    /// GUI is reused, wait for that pane without closing the shared GUI.
-    /// Requires an explicit command, --no-auto-connect, and the local domain.
-    #[arg(long = "return-initial-exit-code")]
-    pub return_initial_exit_code: bool,
+    /// Exit with the child exit code of the pane spawned for PROGRAM. When an
+    /// existing GUI is reused, wait for that pane without closing the shared
+    /// GUI. Requires an explicit command and the local domain.
+    #[arg(long = "wait-exit")]
+    pub wait_exit: bool,
 
     /// When spawning into an existing GUI instance, spawn a new
     /// tab into the active window rather than spawn a new window.
@@ -121,18 +121,18 @@ mod exit_status_flag_tests {
     #[test]
     fn status_reporting_is_explicitly_opted_in() {
         let ordinary = StartCommand::try_parse_from(["start", "--", "cmd.exe"]).unwrap();
-        assert!(!ordinary.return_initial_exit_code);
+        assert!(!ordinary.wait_exit);
 
         let tracked = StartCommand::try_parse_from([
             "start",
             "--always-new-process",
             "--no-auto-connect",
-            "--return-initial-exit-code",
+            "--wait-exit",
             "--",
             "cmd.exe",
         ])
         .unwrap();
-        assert!(tracked.return_initial_exit_code);
+        assert!(tracked.wait_exit);
         assert_eq!(tracked.prog, vec![OsString::from("cmd.exe")]);
     }
 }
